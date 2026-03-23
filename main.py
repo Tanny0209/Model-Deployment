@@ -11,6 +11,7 @@ app = FastAPI()
 MONGO_URI = os.getenv("MONGO_URI")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+
 client = MongoClient(MONGO_URI)
 
 # ------------------ CONFIG ------------------
