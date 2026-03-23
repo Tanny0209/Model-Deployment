@@ -11,7 +11,6 @@ app = FastAPI()
 MONGO_URI = os.getenv("MONGO_URI")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-
 client = MongoClient(MONGO_URI)
 
 # ------------------ CONFIG ------------------
@@ -74,7 +73,7 @@ def predict_sentiment(text):
         print("Sentiment HF:", result)
 
         if isinstance(result, list):
-            label = result[0]["label"]  # e.g. "5 stars"
+            label = result[0]["label"]
             stars = int(label.split()[0])
 
             if stars <= 2:
@@ -130,6 +129,7 @@ def risk_label(score):
 def home():
     return {"status": "API running"}
 
+
 @app.post("/email")
 def process_email(data: dict):
     try:
@@ -171,18 +171,17 @@ def process_email(data: dict):
         final_score = max(0.0, min(final_score, 1.0))
         final_level = risk_label(final_score)
 
-        # -------- EMAIL OBJECT --------
-        email_obj = {
-            "email_id": email_id,
-            "subject": subject,
-            "body": body,
-            "text": text,
+        # ============================================================
+        # 🔥 IMPORTANT FIX: KEEP ALL FIELDS
+        # ============================================================
+        email_obj = data.copy()
+
+        email_obj.update({
             "intent": intent,
             "sentiment": sentiment,
             "risk_score": round(final_score, 4),
             "risk_level": final_level,
-            "created_at": data.get("created_at"),
-        }
+        })
 
         # -------- SAVE --------
         collection.update_one(
