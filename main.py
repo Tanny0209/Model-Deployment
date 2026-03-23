@@ -1,94 +1,60 @@
 from fastapi import FastAPI
 from pymongo import MongoClient
-import torch
-from transformers import AutoTokenizer, AutoModel
 import os
-from dotenv import load_dotenv
 
-# ------------------ LOAD ENV ------------------
-load_dotenv()
+from Sentiment import predict_sentiment
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
 
-# ------------------ INIT APP ------------------
 app = FastAPI()
 
-# ------------------ MONGODB ------------------
+# ---------------- MongoDB ----------------
 MONGO_URI = os.getenv("MONGO_URI")
-
-if not MONGO_URI:
-    raise ValueError("MONGO_URI not set")
-
 client = MongoClient(MONGO_URI)
-db = client["insider_threat"]
-collection = db["emails"]
+db = client["HR"]  # or dynamic later
+collection = db["Users"]
 
-# ------------------ LOAD MODELS ------------------
-
-# GNN model
-gnn_model = torch.load("gnn/final_gnn_model.pt", map_location="cpu")
-gnn_model.eval()
-
-# Intent model
+# ---------------- Intent Model ----------------
 tokenizer = AutoTokenizer.from_pretrained("intent_model/")
-intent_model = AutoModel.from_pretrained("intent_model/")
-intent_model.eval()
+model = AutoModelForSequenceClassification.from_pretrained("intent_model/")
+model.eval()
 
-# Sentiment model
-from Sentiment import predict_sentiment
+ID2LABEL = {
+    0: "confidential",
+    1: "warning",
+    2: "casual",
+    3: "neutral",
+}
 
-# ------------------ HELPERS ------------------
-
-def normalize_department(dept: str):
-    if not dept:
-        return None
-    return dept.strip().upper()
-
-def run_intent(text: str):
+def predict_intent(text):
     inputs = tokenizer(text, return_tensors="pt", truncation=True)
-
     with torch.no_grad():
-        outputs = intent_model(**inputs)
+        outputs = model(**inputs)
+    pred = torch.argmax(outputs.logits, dim=1).item()
+    return ID2LABEL[pred]
 
-    # Simple representation (replace with classifier later)
-    return float(outputs.last_hidden_state.mean())
-
-def run_gnn(text: str):
-    # TODO: Replace with real GNN logic
-    with torch.no_grad():
-        return "gnn_output_placeholder"
-
-# ------------------ ROUTES ------------------
-
+# ---------------- API ----------------
 @app.get("/")
 def home():
-    return {"status": "API is running"}
+    return {"status": "running"}
 
-@app.post("/analyze")
-def analyze(data: dict):
-    try:
-        text = data.get("email")
-        department = normalize_department(data.get("department"))
+@app.post("/email")
+def process_email(data: dict):
+    text = data.get("text")
 
-        if not text:
-            return {"error": "Email text is required"}
+    if not text:
+        return {"error": "text required"}
 
-        # -------- RUN MODELS --------
-        intent = run_intent(text)
-        sentiment = predict_sentiment(text)
-        gnn_result = run_gnn(text)
+    intent = predict_intent(text)
+    sentiment = predict_sentiment(text)
 
-        # -------- RESULT --------
-        result = {
-            "email": text,
-            "department": department,
-            "intent": intent,
-            "sentiment": sentiment,
-            "gnn": gnn_result
-        }
+    result = {
+        "text": text,
+        "intent": intent,
+        "sentiment": sentiment
+    }
 
-        # -------- SAVE --------
-        collection.insert_one(result)
+    # store in MongoDB
+    collection.insert_one(result)
 
-        return result
-
-    except Exception as e:
-        return {"error": str(e)}
+    return result

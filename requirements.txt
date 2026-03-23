@@ -3,4 +3,3 @@ uvicorn
 torch
 transformers
 pymongo
-python-dotenv
