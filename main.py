@@ -5,6 +5,9 @@ import torch
 import re
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+# ------------------ PERFORMANCE ------------------
+torch.set_num_threads(1)
+
 # ------------------ INIT ------------------
 app = FastAPI()
 
@@ -16,11 +19,14 @@ client = MongoClient(MONGO_URI)
 DEPARTMENTS = ["Finance", "HR", "IT", "Sales"]
 COLLECTION_NAME = "Users"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"
 
 # ------------------ LOAD INTENT MODEL ------------------
 tokenizer_intent = AutoTokenizer.from_pretrained("intent_model/")
-model_intent = AutoModelForSequenceClassification.from_pretrained("intent_model/")
+model_intent = AutoModelForSequenceClassification.from_pretrained(
+    "intent_model/",
+    torch_dtype=torch.float32
+)
 model_intent.to(DEVICE)
 model_intent.eval()
 
@@ -31,8 +37,15 @@ ID2LABEL = {
     3: "neutral",
 }
 
-# ------------------ LOAD SENTIMENT MODEL ------------------
-from Sentiment import predict_sentiment  # your existing file
+# ------------------ LOAD LIGHT SENTIMENT MODEL ------------------
+tokenizer_sent = AutoTokenizer.from_pretrained(
+    "distilbert-base-uncased-finetuned-sst-2-english"
+)
+model_sent = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased-finetuned-sst-2-english"
+)
+model_sent.to(DEVICE)
+model_sent.eval()
 
 # ------------------ CLEANING ------------------
 def clean_email_text(text):
@@ -62,8 +75,25 @@ def predict_intent(text):
 
     return ID2LABEL[pred]
 
-# ------------------ RISK FUNCTIONS ------------------
+# ------------------ SENTIMENT ------------------
+@torch.no_grad()
+def predict_sentiment(text):
+    text = clean_email_text(text)
 
+    inputs = tokenizer_sent(
+        text,
+        truncation=True,
+        padding=True,
+        max_length=96,
+        return_tensors="pt"
+    ).to(DEVICE)
+
+    outputs = model_sent(**inputs)
+    pred = torch.argmax(outputs.logits, dim=1).item()
+
+    return "positive" if pred == 1 else "negative"
+
+# ------------------ RISK ------------------
 def intent_risk(intent):
     return {
         "confidential": 1.0,
@@ -75,7 +105,6 @@ def intent_risk(intent):
 def sentiment_risk(sentiment):
     return {
         "negative": 0.7,
-        "neutral": 0.3,
         "positive": 0.1,
     }.get(sentiment, 0.2)
 
@@ -122,35 +151,30 @@ def process_email(data: dict):
 
         full_text = f"{subject} {body} {text}".strip()
 
-        # -------- RUN MODELS --------
+        # -------- MODELS --------
         intent = predict_intent(full_text)
         sentiment = predict_sentiment(full_text)
 
-        # -------- FETCH USER (for GNN score) --------
+        # -------- FETCH USER --------
         doc = collection.find_one({"users." + user_id: {"$exists": True}})
-
         if not doc:
             return {"error": "User not found"}
 
         user_data = doc["users"][user_id]
         graph_score = float(user_data.get("cached_user_graph_score", 0.0))
 
-        # -------- RISK FUSION --------
-        intent_score = intent_risk(intent)
-        sentiment_score = sentiment_risk(sentiment)
-        rule_score = rule_boost(data)
-
+        # -------- RISK --------
         final_score = (
-            0.4 * intent_score +
-            0.2 * sentiment_score +
+            0.4 * intent_risk(intent) +
+            0.2 * sentiment_risk(sentiment) +
             0.4 * graph_score +
-            rule_score
+            rule_boost(data)
         )
 
         final_score = max(0.0, min(final_score, 1.0))
         final_level = risk_label(final_score)
 
-        # -------- BUILD EMAIL OBJECT --------
+        # -------- EMAIL OBJECT --------
         email_obj = {
             "email_id": email_id,
             "subject": subject,
@@ -163,14 +187,10 @@ def process_email(data: dict):
             "created_at": data.get("created_at"),
         }
 
-        # -------- SAVE TO MONGODB --------
+        # -------- SAVE --------
         collection.update_one(
             {"_id": doc["_id"]},
-            {
-                "$set": {
-                    f"users.{user_id}.emails.{email_id}": email_obj
-                }
-            }
+            {"$set": {f"users.{user_id}.emails.{email_id}": email_obj}}
         )
 
         return {
