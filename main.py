@@ -1,51 +1,29 @@
 from fastapi import FastAPI
 from pymongo import MongoClient
 import os
-import torch
 import re
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-# ------------------ PERFORMANCE ------------------
-torch.set_num_threads(1)
+import requests
 
 # ------------------ INIT ------------------
 app = FastAPI()
 
 # ------------------ ENV ------------------
 MONGO_URI = os.getenv("MONGO_URI")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
 client = MongoClient(MONGO_URI)
 
 # ------------------ CONFIG ------------------
 DEPARTMENTS = ["Finance", "HR", "IT", "Sales"]
 COLLECTION_NAME = "Users"
 
-DEVICE = "cpu"
+# ------------------ HF API ------------------
+INTENT_API = "https://api-inference.huggingface.co/models/tanmay0209/intent-model"
+SENTIMENT_API = "https://api-inference.huggingface.co/models/nlptown/bert-base-multilingual-uncased-sentiment"
 
-# ------------------ LOAD INTENT MODEL ------------------
-tokenizer_intent = AutoTokenizer.from_pretrained("intent_model/")
-model_intent = AutoModelForSequenceClassification.from_pretrained(
-    "intent_model/",
-    torch_dtype=torch.float32
-)
-model_intent.to(DEVICE)
-model_intent.eval()
-
-ID2LABEL = {
-    0: "confidential",
-    1: "warning",
-    2: "casual",
-    3: "neutral",
+headers = {
+    "Authorization": f"Bearer {HF_TOKEN}"
 }
-
-# ------------------ LOAD LIGHT SENTIMENT MODEL ------------------
-tokenizer_sent = AutoTokenizer.from_pretrained(
-    "distilbert-base-uncased-finetuned-sst-2-english"
-)
-model_sent = AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased-finetuned-sst-2-english"
-)
-model_sent.to(DEVICE)
-model_sent.eval()
 
 # ------------------ CLEANING ------------------
 def clean_email_text(text):
@@ -58,42 +36,60 @@ def clean_email_text(text):
     return text
 
 # ------------------ INTENT ------------------
-@torch.no_grad()
 def predict_intent(text):
-    text = clean_email_text(text)
+    try:
+        text = clean_email_text(text)
 
-    inputs = tokenizer_intent(
-        text,
-        truncation=True,
-        padding="max_length",
-        max_length=64,
-        return_tensors="pt"
-    ).to(DEVICE)
+        response = requests.post(
+            INTENT_API,
+            headers=headers,
+            json={"inputs": text}
+        )
 
-    outputs = model_intent(**inputs)
-    pred = torch.argmax(outputs.logits, dim=1).item()
+        result = response.json()
+        print("Intent HF:", result)
 
-    return ID2LABEL[pred]
+        if isinstance(result, list):
+            return result[0]["label"]
+
+        return "neutral"
+
+    except Exception as e:
+        print("Intent error:", e)
+        return "neutral"
 
 # ------------------ SENTIMENT ------------------
-@torch.no_grad()
 def predict_sentiment(text):
-    text = clean_email_text(text)
+    try:
+        text = clean_email_text(text)
 
-    inputs = tokenizer_sent(
-        text,
-        truncation=True,
-        padding=True,
-        max_length=96,
-        return_tensors="pt"
-    ).to(DEVICE)
+        response = requests.post(
+            SENTIMENT_API,
+            headers=headers,
+            json={"inputs": text}
+        )
 
-    outputs = model_sent(**inputs)
-    pred = torch.argmax(outputs.logits, dim=1).item()
+        result = response.json()
+        print("Sentiment HF:", result)
 
-    return "positive" if pred == 1 else "negative"
+        if isinstance(result, list):
+            label = result[0]["label"]  # e.g. "5 stars"
+            stars = int(label.split()[0])
 
-# ------------------ RISK ------------------
+            if stars <= 2:
+                return "negative"
+            elif stars == 3:
+                return "neutral"
+            else:
+                return "positive"
+
+        return "neutral"
+
+    except Exception as e:
+        print("Sentiment error:", e)
+        return "neutral"
+
+# ------------------ RISK FUNCTIONS ------------------
 def intent_risk(intent):
     return {
         "confidential": 1.0,
@@ -105,6 +101,7 @@ def intent_risk(intent):
 def sentiment_risk(sentiment):
     return {
         "negative": 0.7,
+        "neutral": 0.3,
         "positive": 0.1,
     }.get(sentiment, 0.2)
 
@@ -151,7 +148,7 @@ def process_email(data: dict):
 
         full_text = f"{subject} {body} {text}".strip()
 
-        # -------- MODELS --------
+        # -------- MODEL OUTPUT --------
         intent = predict_intent(full_text)
         sentiment = predict_sentiment(full_text)
 
@@ -160,10 +157,9 @@ def process_email(data: dict):
         if not doc:
             return {"error": "User not found"}
 
-        user_data = doc["users"][user_id]
-        graph_score = float(user_data.get("cached_user_graph_score", 0.0))
+        graph_score = float(doc["users"][user_id].get("cached_user_graph_score", 0.0))
 
-        # -------- RISK --------
+        # -------- RISK FUSION --------
         final_score = (
             0.4 * intent_risk(intent) +
             0.2 * sentiment_risk(sentiment) +
@@ -190,7 +186,11 @@ def process_email(data: dict):
         # -------- SAVE --------
         collection.update_one(
             {"_id": doc["_id"]},
-            {"$set": {f"users.{user_id}.emails.{email_id}": email_obj}}
+            {
+                "$set": {
+                    f"users.{user_id}.emails.{email_id}": email_obj
+                }
+            }
         )
 
         return {
